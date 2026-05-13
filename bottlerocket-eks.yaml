@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS Cluster with Bottlerocket nodes and Update Operator - Using Default VPC'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: bottlerocket-eks-cluster
+    Description: Name of the EKS cluster
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.29'
+    Description: Kubernetes version
+    AllowedValues:
+      - '1.29'
+      - '1.28'
+      - '1.27'
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for worker nodes
+
+  NodeGroupDesiredSize:
+    Type: Number
+    Default: 2
+    Description: Desired number of worker nodes
+
+  NodeGroupMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of worker nodes
+
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum number of worker nodes
+
+Mappings:
+  # Bottlerocket AMI IDs by region (update these periodically)
+  BottlerocketAMI:
+    ap-southeast-2:
+      AMI: ami-05e40e830a99c1e4e
+    us-east-1:
+      AMI: ami-05e40e830a99c1e4e
+    us-west-2:
+      AMI: ami-05e40e830a99c1e4e
+    eu-west-1:
+      AMI: ami-05e40e830a99c1e4e
+
+Resources:
+  # ==================== Security Group ====================
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS cluster
+      VpcId: !GetAtt VPCInfo.VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-sg'
+
+  # Lambda to get Default VPC and Subnet info
+  VPCInfoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-vpc-info'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt VPCInfoFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import traceback
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  ec2 = boto3.client('ec2')
+
+                  # Get default VPC
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  if not vpcs['Vpcs']:
+                      raise Exception('No default VPC found')
+
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+
+                  # Get all subnets in default VPC
+                  subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])
+                  subnet_ids = [s['SubnetId'] for s in subnets['Subnets']]
+
+                  if len(subnet_ids) < 2:
+                      raise Exception(f'Need at least 2 subnets, found {len(subnet_ids)}')
+
+                  response_data = {
+                      'VpcId': vpc_id,
+                      'SubnetIds': ','.join(subnet_ids)
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  traceback.print_exc()
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  VPCInfoFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2ReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: '*'
+
+  VPCInfo:
+    Type: Custom::VPCInfo
+    Properties:
+      ServiceToken: !GetAtt VPCInfoFunction.Arn
+
+  # ==================== EKS Cluster ====================
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        SubnetIds: !Split [',', !GetAtt VPCInfo.SubnetIds]
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+
+  # ==================== Node Group IAM Role ====================
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-role'
+
+  # Additional policy for Bottlerocket Update Operator
+  BottlerocketUpdatePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BottlerocketUpdatePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - autoscaling:DescribeAutoScalingGroups
+              - autoscaling:DescribeAutoScalingInstances
+              - autoscaling:SetDesiredCapacity
+              - autoscaling:TerminateInstanceInAutoScalingGroup
+            Resource: '*'
+      Roles:
+        - !Ref NodeRole
+
+  # ==================== Bottlerocket Node Group ====================
+  BottlerocketLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ClusterName}-bottlerocket-lt'
+      LaunchTemplateData:
+        ImageId: !FindInMap [BottlerocketAMI, !Ref 'AWS::Region', AMI]
+        InstanceType: !Ref NodeInstanceType
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+          - DeviceName: /dev/xvdb
+            Ebs:
+              VolumeSize: 80
+              VolumeType: gp3
+              Encrypted: true
+        UserData:
+          Fn::Base64: !Sub |
+            [settings]
+            [settings.kubernetes]
+            cluster-name = "${ClusterName}"
+            api-server = "${EKSCluster.Endpoint}"
+            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+
+            [settings.kubernetes.node-labels]
+            "bottlerocket.aws/updater-interface-version" = "2.0.0"
+
+            [settings.updates]
+            metadata-base-url = "https://updates.bottlerocket.aws/2020-07-07"
+            target-base-url = "https://updates.bottlerocket.aws/targets"
+
+  BottlerocketNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: bottlerocket-nodes
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: !Split [',', !GetAtt VPCInfo.SubnetIds]
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredSize
+      LaunchTemplate:
+        Id: !Ref BottlerocketLaunchTemplate
+      Labels:
+        nodegroup-type: bottlerocket
+      Tags:
+        Name: !Sub '${ClusterName}-bottlerocket-node'
+        k8s.io/cluster-autoscaler/enabled: 'true'
+
+  # ==================== OIDC Provider for IRSA ====================
+  OIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+
+  # ==================== Bottlerocket Update Operator IRSA ====================
+  BottlerocketUpdateOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt OIDCProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+      Policies:
+        - PolicyName: BottlerocketUpdateOperatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+Outputs:
+  ClusterName:
+    Description: EKS Cluster Name
+    Value: !Ref ClusterName
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: EKS Cluster Endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: EKS Cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  NodeRoleArn:
+    Description: Node IAM Role ARN
+    Value: !GetAtt NodeRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeRoleArn'
+
+  OIDCProviderArn:
+    Description: OIDC Provider ARN for IRSA
+    Value: !GetAtt OIDCProvider.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCProviderArn'
+
+  BottlerocketUpdateOperatorRoleArn:
+    Description: IAM Role ARN for Bottlerocket Update Operator
+    Value: !GetAtt BottlerocketUpdateOperatorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BrupopRoleArn'
+
+  VpcId:
+    Description: VPC ID (Default VPC)
+    Value: !GetAtt VPCInfo.VpcId
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  SubnetIds:
+    Description: Subnet IDs used
+    Value: !GetAtt VPCInfo.SubnetIds
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetIds'
