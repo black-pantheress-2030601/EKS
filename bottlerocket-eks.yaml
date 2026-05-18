@@ -1,146 +1,139 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'EKS Cluster with Bottlerocket nodes and Update Operator - Using Default VPC'
+Description: >
+  EKS Cluster with Pod Identity and EKS Update Operator IAM role.
+  The Update Operator runs on the system node group alongside other cluster tooling.
 
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
 Parameters:
+
   ClusterName:
     Type: String
-    Default: bottlerocket-eks-cluster
-    Description: Name of the EKS cluster
+    Default: eks-cluster
+    Description: Name of the EKS cluster.
 
   KubernetesVersion:
     Type: String
-    Default: '1.29'
-    Description: Kubernetes version
-    AllowedValues:
-      - '1.29'
-      - '1.28'
-      - '1.27'
+    Default: "1.30"
+    AllowedValues: ["1.28", "1.29", "1.30"]
+    Description: Kubernetes version for the control plane.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy the cluster into.
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two private subnets in different AZs for node groups
+      and the control plane ENIs.
 
   NodeInstanceType:
     Type: String
-    Default: t3.medium
-    Description: EC2 instance type for worker nodes
+    Default: m5.large
+    Description: EC2 instance type for the system node group.
 
   NodeGroupDesiredSize:
     Type: Number
     Default: 2
-    Description: Desired number of worker nodes
 
   NodeGroupMinSize:
     Type: Number
     Default: 1
-    Description: Minimum number of worker nodes
 
   NodeGroupMaxSize:
     Type: Number
-    Default: 4
-    Description: Maximum number of worker nodes
+    Default: 5
 
-Mappings:
-  # Bottlerocket AMI IDs by region (update these periodically)
-  BottlerocketAMI:
-    ap-southeast-2:
-      AMI: ami-05e40e830a99c1e4e
-    us-east-1:
-      AMI: ami-05e40e830a99c1e4e
-    us-west-2:
-      AMI: ami-05e40e830a99c1e4e
-    eu-west-1:
-      AMI: ami-05e40e830a99c1e4e
+  EnablePrivateEndpoint:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
 
+  EnvironmentTag:
+    Type: String
+    Default: production
+
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
 Resources:
-  # ==================== Security Group ====================
+
+  # ── Security Groups ────────────────────────────────────────────────────────
+
   ClusterSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for EKS cluster
-      VpcId: !GetAtt VPCInfo.VpcId
+      GroupDescription: !Sub "Control plane SG for ${ClusterName}"
+      VpcId: !Ref VpcId
       Tags:
         - Key: Name
-          Value: !Sub '${ClusterName}-cluster-sg'
+          Value: !Sub "${ClusterName}-cluster-sg"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
 
-  # Lambda to get Default VPC and Subnet info
-  VPCInfoFunction:
-    Type: AWS::Lambda::Function
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      FunctionName: !Sub '${ClusterName}-vpc-info'
-      Runtime: python3.11
-      Handler: index.handler
-      Timeout: 60
-      Role: !GetAtt VPCInfoFunctionRole.Arn
-      Code:
-        ZipFile: |
-          import boto3
-          import cfnresponse
-          import traceback
+      GroupDescription: !Sub "Node SG for ${ClusterName}"
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-node-sg"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
 
-          def handler(event, context):
-              try:
-                  if event['RequestType'] == 'Delete':
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                      return
+  # Allow nodes to communicate with each other
+  NodeToNodeIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Node-to-node all traffic
 
-                  ec2 = boto3.client('ec2')
+  # Allow control plane to reach nodes (kubelet, metrics)
+  ControlPlaneToNodeIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: Control plane to node ephemeral ports
 
-                  # Get default VPC
-                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
-                  if not vpcs['Vpcs']:
-                      raise Exception('No default VPC found')
+  ControlPlaneToNodeIngress443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: Control plane to node HTTPS
 
-                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+  # Allow nodes to reach control plane
+  NodeToControlPlaneIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Nodes to API server HTTPS
 
-                  # Get all subnets in default VPC
-                  subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])
-                  subnet_ids = [s['SubnetId'] for s in subnets['Subnets']]
+  # ── IAM: Cluster Role ──────────────────────────────────────────────────────
 
-                  if len(subnet_ids) < 2:
-                      raise Exception(f'Need at least 2 subnets, found {len(subnet_ids)}')
-
-                  response_data = {
-                      'VpcId': vpc_id,
-                      'SubnetIds': ','.join(subnet_ids)
-                  }
-
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-              except Exception as e:
-                  print(f'Error: {str(e)}')
-                  traceback.print_exc()
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
-
-  VPCInfoFunctionRole:
+  EKSClusterRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: EC2ReadPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ec2:DescribeVpcs
-                  - ec2:DescribeSubnets
-                Resource: '*'
-
-  VPCInfo:
-    Type: Custom::VPCInfo
-    Properties:
-      ServiceToken: !GetAtt VPCInfoFunction.Arn
-
-  # ==================== EKS Cluster ====================
-  ClusterRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -148,27 +141,18 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
-        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
 
-  EKSCluster:
-    Type: AWS::EKS::Cluster
-    Properties:
-      Name: !Ref ClusterName
-      Version: !Ref KubernetesVersion
-      RoleArn: !GetAtt ClusterRole.Arn
-      ResourcesVpcConfig:
-        SecurityGroupIds:
-          - !Ref ClusterSecurityGroup
-        SubnetIds: !Split [',', !GetAtt VPCInfo.SubnetIds]
-        EndpointPublicAccess: true
-        EndpointPrivateAccess: true
+  # ── IAM: Node Role ─────────────────────────────────────────────────────────
 
-  # ==================== Node Group IAM Role ====================
-  NodeRole:
+  EKSNodeRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${ClusterName}-node-role"
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -176,171 +160,243 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
-        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Tags:
-        - Key: Name
-          Value: !Sub '${ClusterName}-node-role'
+        - Key: Environment
+          Value: !Ref EnvironmentTag
 
-  # Additional policy for Bottlerocket Update Operator
-  BottlerocketUpdatePolicy:
-    Type: AWS::IAM::Policy
-    Properties:
-      PolicyName: BottlerocketUpdatePolicy
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Action:
-              - ec2:DescribeInstances
-              - autoscaling:DescribeAutoScalingGroups
-              - autoscaling:DescribeAutoScalingInstances
-              - autoscaling:SetDesiredCapacity
-              - autoscaling:TerminateInstanceInAutoScalingGroup
-            Resource: '*'
-      Roles:
-        - !Ref NodeRole
+  # ── IAM: Pod Identity Role for EKS Update Operator ────────────────────────
+  #
+  # EKS Pod Identity replaces IRSA. The trust policy uses
+  # eks-auth.amazonaws.com as the principal, not the OIDC provider ARN.
+  # Permissions here allow the Update Operator to describe/update node groups.
 
-  # ==================== Bottlerocket Node Group ====================
-  BottlerocketLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateName: !Sub '${ClusterName}-bottlerocket-lt'
-      LaunchTemplateData:
-        ImageId: !FindInMap [BottlerocketAMI, !Ref 'AWS::Region', AMI]
-        InstanceType: !Ref NodeInstanceType
-        MetadataOptions:
-          HttpTokens: required
-          HttpPutResponseHopLimit: 2
-        BlockDeviceMappings:
-          - DeviceName: /dev/xvda
-            Ebs:
-              VolumeSize: 20
-              VolumeType: gp3
-              Encrypted: true
-          - DeviceName: /dev/xvdb
-            Ebs:
-              VolumeSize: 80
-              VolumeType: gp3
-              Encrypted: true
-        UserData:
-          Fn::Base64: !Sub |
-            [settings]
-            [settings.kubernetes]
-            cluster-name = "${ClusterName}"
-            api-server = "${EKSCluster.Endpoint}"
-            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
-
-            [settings.kubernetes.node-labels]
-            "bottlerocket.aws/updater-interface-version" = "2.0.0"
-
-            [settings.updates]
-            metadata-base-url = "https://updates.bottlerocket.aws/2020-07-07"
-            target-base-url = "https://updates.bottlerocket.aws/targets"
-
-  BottlerocketNodeGroup:
-    Type: AWS::EKS::Nodegroup
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref ClusterName
-      NodegroupName: bottlerocket-nodes
-      NodeRole: !GetAtt NodeRole.Arn
-      Subnets: !Split [',', !GetAtt VPCInfo.SubnetIds]
-      ScalingConfig:
-        MinSize: !Ref NodeGroupMinSize
-        MaxSize: !Ref NodeGroupMaxSize
-        DesiredSize: !Ref NodeGroupDesiredSize
-      LaunchTemplate:
-        Id: !Ref BottlerocketLaunchTemplate
-      Labels:
-        nodegroup-type: bottlerocket
-      Tags:
-        Name: !Sub '${ClusterName}-bottlerocket-node'
-        k8s.io/cluster-autoscaler/enabled: 'true'
-
-  # ==================== OIDC Provider for IRSA ====================
-  OIDCProvider:
-    Type: AWS::IAM::OIDCProvider
-    Properties:
-      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
-      ClientIdList:
-        - sts.amazonaws.com
-      ThumbprintList:
-        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
-
-  # ==================== Bottlerocket Update Operator IRSA ====================
-  BottlerocketUpdateOperatorRole:
+  UpdateOperatorPodRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${ClusterName}-update-operator-pod-role"
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !GetAtt OIDCProvider.Arn
-            Action: sts:AssumeRoleWithWebIdentity
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
       Policies:
-        - PolicyName: BottlerocketUpdateOperatorPolicy
+        - PolicyName: UpdateOperatorPolicy
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
+              # Describe cluster and node group state
               - Effect: Allow
                 Action:
+                  - eks:DescribeCluster
+                  - eks:DescribeNodegroup
+                  - eks:ListNodegroups
+                  - eks:ListUpdates
+                  - eks:DescribeUpdate
+                Resource: !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
+              - Effect: Allow
+                Action:
+                  - eks:DescribeNodegroup
+                  - eks:UpdateNodegroupVersion
+                  - eks:UpdateNodegroupConfig
+                Resource: !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/${ClusterName}/*/*"
+              # Read SSM for latest EKS optimised AMI versions
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: "arn:aws:ssm:*:*:parameter/aws/service/eks/optimized-ami/*"
+              # EC2 permissions for drain / cordon coordination
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
                   - autoscaling:DescribeAutoScalingGroups
                   - autoscaling:DescribeAutoScalingInstances
-                  - autoscaling:SetDesiredCapacity
-                  - autoscaling:TerminateInstanceInAutoScalingGroup
-                  - ec2:DescribeInstances
-                Resource: '*'
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
 
+  # ── EKS Cluster ────────────────────────────────────────────────────────────
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: !Split [",", !Join [",", !Ref PrivateSubnetIds]]
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        EndpointPublicAccess: false
+        EndpointPrivateAccess: true
+      AccessConfig:
+        # API + ConfigMap mode allows both aws-auth and access entries
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging: 
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # ── EKS Pod Identity Agent Add-on ─────────────────────────────────────────
+  #
+  # The eks-pod-identity-agent daemonset must be installed before Pod
+  # Identity associations can issue credentials to pods.
+
+  PodIdentityAgentAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: SystemNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # ── Additional recommended add-ons ────────────────────────────────────────
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: SystemNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  # ── System Node Group ──────────────────────────────────────────────────────
+
+  SystemNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn:
+      - VpcCniAddon
+      - KubeProxyAddon
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub "${ClusterName}-system"
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      Subnets: !Ref PrivateSubnetIds
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        DesiredSize: !Ref NodeGroupDesiredSize
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      UpdateConfig:
+        MaxUnavailablePercentage: 33
+      Labels:
+        role: system
+      Tags:
+        Environment: !Ref EnvironmentTag
+        NodeGroupType: system
+
+  # ── Pod Identity Association ───────────────────────────────────────────────
+  #
+  # Binds the IAM role to the update-operator service account in the
+  # eks-update-operator namespace. When a pod uses that service account,
+  # the Pod Identity agent injects temporary credentials automatically.
+  # No OIDC provider, no annotation on the service account required.
+
+  UpdateOperatorPodIdentityAssociation:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn:
+      - PodIdentityAgentAddon
+      - SystemNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: eks-update-operator
+      ServiceAccount: eks-update-operator
+      RoleArn: !GetAtt UpdateOperatorPodRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
 Outputs:
+
   ClusterName:
-    Description: EKS Cluster Name
+    Description: EKS cluster name
     Value: !Ref ClusterName
     Export:
-      Name: !Sub '${AWS::StackName}-ClusterName'
-
-  ClusterEndpoint:
-    Description: EKS Cluster Endpoint
-    Value: !GetAtt EKSCluster.Endpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+      Name: !Sub "${AWS::StackName}-ClusterName"
 
   ClusterArn:
-    Description: EKS Cluster ARN
+    Description: EKS cluster ARN
     Value: !GetAtt EKSCluster.Arn
     Export:
-      Name: !Sub '${AWS::StackName}-ClusterArn'
+      Name: !Sub "${AWS::StackName}-ClusterArn"
+
+  ClusterEndpoint:
+    Description: EKS API server endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterEndpoint"
+
+  ClusterCertificateAuthority:
+    Description: Base64-encoded cluster CA certificate (not exported due to length limit)
+    Value: !GetAtt EKSCluster.CertificateAuthorityData
 
   NodeRoleArn:
-    Description: Node IAM Role ARN
-    Value: !GetAtt NodeRole.Arn
+    Description: IAM role ARN for node groups
+    Value: !GetAtt EKSNodeRole.Arn
     Export:
-      Name: !Sub '${AWS::StackName}-NodeRoleArn'
+      Name: !Sub "${AWS::StackName}-NodeRoleArn"
 
-  OIDCProviderArn:
-    Description: OIDC Provider ARN for IRSA
-    Value: !GetAtt OIDCProvider.Arn
+  UpdateOperatorPodRoleArn:
+    Description: IAM role ARN bound to the Update Operator pod via Pod Identity
+    Value: !GetAtt UpdateOperatorPodRole.Arn
     Export:
-      Name: !Sub '${AWS::StackName}-OIDCProviderArn'
+      Name: !Sub "${AWS::StackName}-UpdateOperatorPodRoleArn"
 
-  BottlerocketUpdateOperatorRoleArn:
-    Description: IAM Role ARN for Bottlerocket Update Operator
-    Value: !GetAtt BottlerocketUpdateOperatorRole.Arn
+  SystemNodeGroupName:
+    Description: System managed node group name
+    Value: !Ref SystemNodeGroup
     Export:
-      Name: !Sub '${AWS::StackName}-BrupopRoleArn'
+      Name: !Sub "${AWS::StackName}-SystemNodeGroup"
 
-  VpcId:
-    Description: VPC ID (Default VPC)
-    Value: !GetAtt VPCInfo.VpcId
+  PodIdentityAssociationArn:
+    Description: >
+      Pod Identity association ARN linking the eks-update-operator
+      service account to the IAM role.
+    Value: !Ref UpdateOperatorPodIdentityAssociation
     Export:
-      Name: !Sub '${AWS::StackName}-VpcId'
+      Name: !Sub "${AWS::StackName}-PodIdentityAssociation"
 
-  SubnetIds:
-    Description: Subnet IDs used
-    Value: !GetAtt VPCInfo.SubnetIds
-    Export:
-      Name: !Sub '${AWS::StackName}-SubnetIds'
+  KubeconfigCommand:
+    Description: AWS CLI command to update local kubeconfig
+    Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}"
