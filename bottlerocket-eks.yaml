@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  EKS Cluster with Pod Identity and EKS Update Operator IAM role.
+  EKS Cluster with Bottlerocket AMI managed node group, Pod Identity, and EKS Update Operator IAM role.
   The Update Operator runs on the system node group alongside other cluster tooling.
 
 # ---------------------------------------------------------------------------
@@ -313,7 +313,7 @@ Resources:
         DesiredSize: !Ref NodeGroupDesiredSize
         MinSize: !Ref NodeGroupMinSize
         MaxSize: !Ref NodeGroupMaxSize
-      AmiType: AL2_x86_64
+      AmiType: BOTTLEROCKET_x86_64
       CapacityType: ON_DEMAND
       UpdateConfig:
         MaxUnavailablePercentage: 33
